@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+python-dotenv
+
+numpy<2
+faiss-cpu
+
+sentence-transformers==2.6.1
+transformers==4.38.2
