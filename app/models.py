@@ -10,6 +10,9 @@ class Prompt(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     content = Column(Text, nullable=False)
+    month = Column(String, nullable=True)
+    city = Column(String, nullable=True)
+    year = Column(String, nullable=True)
     prompt_text = Column(Text, nullable=False)
     embedding = Column(JSONB, nullable=False) 
     created_at = Column(DateTime, default=datetime.utcnow)

@@ -1,5 +1,5 @@
 version: "3.9"
-
+name: onegcc
 services:
   postgres:
     image: postgres:15

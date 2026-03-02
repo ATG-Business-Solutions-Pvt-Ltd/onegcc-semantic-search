@@ -4,35 +4,53 @@ from app.schemas import AskRequest
 from app.db import SessionLocal
 from app.models import Prompt, QueryCache
 from app.embeddings import get_embedding
-from app.faiss_index import add_to_index, search_index
+
 import re
+import calendar
+import spacy
+import numpy as np
+import faiss
 
-CITIES = ["mumbai","delhi","hyderabad","bangalore","chennai"]
-MONTHS = ["january","february","march","april","may","june","july","august","september","october","november","december"]
+# -------------------------
+# Config
+# -------------------------
 
+DIMENSION = 384
+SEMANTIC_THRESHOLD = 0.75
+
+nlp = spacy.load("en_core_web_sm")
 router = APIRouter()
 
 
-def extract_city(text):
-    text = text.lower()
-    for city in CITIES:
-        if city in text:
-            return city
+# -------------------------
+# Metadata Extractors
+# -------------------------
+
+def extract_city(text: str):
+    doc = nlp(text)
+    for ent in doc.ents:
+        if ent.label_ == "GPE":
+            return ent.text.lower()
     return None
 
 
-def extract_month(text):
+def extract_month(text: str):
     text = text.lower()
-    for month in MONTHS:
+    months = [m.lower() for m in calendar.month_name if m]
+    for month in months:
         if month in text:
             return month
     return None
 
 
-def extract_year(text):
-    match = re.search(r'\b(20\d{2}|19\d{2})\b', text)
+def extract_year(text: str):
+    match = re.search(r"\b(19\d{2}|20\d{2})\b", text)
     return match.group(1) if match else None
 
+
+# -------------------------
+# DB Dependency
+# -------------------------
 
 def get_db():
     db = SessionLocal()
@@ -42,71 +60,125 @@ def get_db():
         db.close()
 
 
+# -------------------------
+# Main Ask Route
+# -------------------------
+
 @router.post("/ask")
 def ask_question(request: AskRequest, db: Session = Depends(get_db)):
 
-    query_embedding = get_embedding(request.prompt)
+    query_text = request.prompt
+    query_embedding = get_embedding(query_text)
 
-    matched_ids, distances = search_index(query_embedding, k=5)
+    # Extract metadata
+    city = extract_city(query_text)
+    month = extract_month(query_text)
+    year = extract_year(query_text)
 
-    city = extract_city(request.prompt)
-    month = extract_month(request.prompt)
-    year = extract_year(request.prompt)
+    print("Query:", query_text)
+    print("Extracted -> City:", city, "Month:", month, "Year:", year)
 
-    semantic_threshold = 1.3
+    # -------------------------
+    # 1️⃣ Metadata Pre-Filtering
+    # -------------------------
 
-    # 🔹 Apply threshold + metadata filtering AFTER vector search
-    for i, prompt_id in enumerate(matched_ids):
+    query = db.query(Prompt)
 
-        distance = distances[i]
+    if city:
+        query = query.filter(Prompt.city == city)
 
-        if distance > semantic_threshold:
-            continue
+    if month:
+        query = query.filter(Prompt.month == month)
 
-        similar_prompt = db.query(Prompt).filter(Prompt.id == prompt_id).first()
+    if year:
+        query = query.filter(Prompt.year == year)
 
-        if not similar_prompt:
-            continue
+    filtered_prompts = query.all()
 
-        content_lower = similar_prompt.content.lower()
+    # If no structured match found → fallback to global search
+    if not filtered_prompts:
+        print("No metadata match found. Falling back to global search.")
+        filtered_prompts = db.query(Prompt).all()
 
-        if city and city not in content_lower:
-            continue
+    if not filtered_prompts:
+        print("No prompts in database.")
+        return {
+            "source": "llm",
+            "sql_query": "No prompts available",
+            "result": {"data": "No data"}
+        }
 
-        if month and month not in content_lower:
-            continue
+    # -------------------------
+    # 2️⃣ Build Temporary FAISS (Cosine Similarity)
+    # -------------------------
 
-        if year and year not in content_lower:
+    embeddings = np.array(
+        [p.embedding for p in filtered_prompts],
+        dtype="float32"
+    )
+
+    faiss.normalize_L2(embeddings)
+
+    index = faiss.IndexFlatIP(DIMENSION)
+    index.add(embeddings)
+
+    query_vector = np.array([query_embedding], dtype="float32")
+    faiss.normalize_L2(query_vector)
+
+    similarities, indices = index.search(
+        query_vector,
+        k=len(filtered_prompts)
+    )
+
+    # -------------------------
+    # 3️⃣ Threshold + Cache Check
+    # -------------------------
+
+    for i, idx in enumerate(indices[0]):
+
+        similarity = similarities[0][i]
+        candidate_prompt = filtered_prompts[idx]
+
+        print("Similarity:", similarity, "| Prompt:", candidate_prompt.content)
+
+        if similarity < SEMANTIC_THRESHOLD:
             continue
 
         cached_query = db.query(QueryCache).filter(
-            QueryCache.prompt_id == similar_prompt.id
+            QueryCache.prompt_id == candidate_prompt.id
         ).first()
 
         if cached_query:
+            print("Returning semantic cache result.")
             return {
                 "source": "semantic_cache",
-                "matched_prompt": similar_prompt.content,
-                "distance": float(distance),
+                "matched_prompt": candidate_prompt.content,
+                "similarity": float(similarity),
                 "sql_query": cached_query.sql_query,
                 "result": cached_query.result_json
             }
 
-    # 🔹 LLM fallback
-    generated_sql = f"SELECT * FROM sales WHERE question = '{request.prompt}'"
+    # -------------------------
+    # 4️⃣ LLM Fallback
+    # -------------------------
+
+    print("Falling back to LLM.")
+
+    generated_sql = f"SELECT * FROM sales WHERE question = '{query_text}'"
     fake_result = {"data": "Sample result"}
 
     new_prompt = Prompt(
-        content=request.prompt,
-        prompt_text=request.prompt,
+        content=query_text,
+        prompt_text=query_text,
+        month=month,
+        city=city,
+        year=year,
         embedding=query_embedding
     )
 
     db.add(new_prompt)
     db.commit()
     db.refresh(new_prompt)
-
-    add_to_index(new_prompt.id, query_embedding)
 
     new_query = QueryCache(
         prompt_id=new_prompt.id,
